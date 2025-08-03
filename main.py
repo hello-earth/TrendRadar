@@ -68,12 +68,16 @@ def load_config():
     config["WEWORK_WEBHOOK_URL"] = os.environ.get(
         "WEWORK_WEBHOOK_URL", ""
     ).strip() or webhooks.get("wework_url", "")
+    config["WEWORK_CORP"] = os.environ.get(
+        "WEWORK_CORP", ""
+    ).strip() or webhooks.get("wework_url", "")
     config["TELEGRAM_BOT_TOKEN"] = os.environ.get(
         "TELEGRAM_BOT_TOKEN", ""
     ).strip() or webhooks.get("telegram_bot_token", "")
     config["TELEGRAM_CHAT_ID"] = os.environ.get(
         "TELEGRAM_CHAT_ID", ""
     ).strip() or webhooks.get("telegram_chat_id", "")
+    
 
     # 输出配置来源信息
     webhook_sources = []
@@ -83,8 +87,8 @@ def load_config():
     if config["DINGTALK_WEBHOOK_URL"]:
         source = "环境变量" if os.environ.get("DINGTALK_WEBHOOK_URL") else "配置文件"
         webhook_sources.append(f"钉钉({source})")
-    if config["WEWORK_WEBHOOK_URL"]:
-        source = "环境变量" if os.environ.get("WEWORK_WEBHOOK_URL") else "配置文件"
+    if config["WEWORK_WEBHOOK_URL"] or config["WEWORK_CORP"]:
+        source = "环境变量" if os.environ.get("WEWORK_WEBHOOK_URL") or os.environ.get("WEWORK_CORP") else "配置文件"
         webhook_sources.append(f"企业微信({source})")
     if config["TELEGRAM_BOT_TOKEN"] and config["TELEGRAM_CHAT_ID"]:
         token_source = (
@@ -2082,8 +2086,11 @@ def send_to_webhooks(
     feishu_url = CONFIG["FEISHU_WEBHOOK_URL"]
     dingtalk_url = CONFIG["DINGTALK_WEBHOOK_URL"]
     wework_url = CONFIG["WEWORK_WEBHOOK_URL"]
+    wework_corp = CONFIG["WEWORK_CORP"]
     telegram_token = CONFIG["TELEGRAM_BOT_TOKEN"]
     telegram_chat_id = CONFIG["TELEGRAM_CHAT_ID"]
+
+    
 
     update_info_to_send = update_info if CONFIG["SHOW_VERSION_UPDATE"] else None
 
@@ -2100,7 +2107,10 @@ def send_to_webhooks(
         )
 
     # 发送到企业微信
-    if wework_url:
+    if wework_corp:
+        wecorp = json.loads(wework_corp)
+        results["wework"] = send_to_weworkcorp(wework_corp, report_data, report_type, update_info_to_send, proxy_url, mode)
+    elif wework_url:
         results["wework"] = send_to_wework(
             wework_url, report_data, report_type, update_info_to_send, proxy_url, mode
         )
@@ -2253,6 +2263,65 @@ def send_to_wework(
             )
             if response.status_code == 200:
                 result = response.json()
+                if result.get("errcode") == 0:
+                    print(f"企业微信第 {i}/{len(batches)} 批次发送成功 [{report_type}]")
+                    # 批次间间隔
+                    if i < len(batches):
+                        time.sleep(CONFIG["BATCH_SEND_INTERVAL"])
+                else:
+                    print(
+                        f"企业微信第 {i}/{len(batches)} 批次发送失败 [{report_type}]，错误：{result.get('errmsg')}"
+                    )
+                    return False
+            else:
+                print(
+                    f"企业微信第 {i}/{len(batches)} 批次发送失败 [{report_type}]，状态码：{response.status_code}"
+                )
+                return False
+        except Exception as e:
+            print(f"企业微信第 {i}/{len(batches)} 批次发送出错 [{report_type}]：{e}")
+            return False
+
+    print(f"企业微信所有 {len(batches)} 批次发送完成 [{report_type}]")
+    return True
+
+def send_to_weworkcorp( 
+    wecorp: Dict,
+    report_data: Dict,
+    report_type: str,
+    update_info: Optional[Dict] = None,
+    proxy_url: Optional[str] = None,
+    mode: str = "daily",
+) -> bool:
+    """发送到企业微信（支持分批发送）"""
+    headers = {"Content-Type": "application/json"}
+    proxies = None
+    if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
+
+    # 获取分批内容
+    batches = split_content_into_batches(report_data, "wework", update_info, mode=mode)
+
+    print(f"企业微信消息分为 {len(batches)} 批次发送 [{report_type}]")
+
+    from wkwechat import WKWechat
+    wechat = WKWechat(wecorp["corpid"], wecorp["corpsecret"])
+
+    # 逐批发送
+    for i, batch_content in enumerate(batches, 1):
+        batch_size = len(batch_content.encode("utf-8"))
+        print(
+            f"发送企业微信第 {i}/{len(batches)} 批次，大小：{batch_size} 字节 [{report_type}]"
+        )
+
+        # 添加批次标识
+        if len(batches) > 1:
+            batch_header = f"**[第 {i}/{len(batches)} 批次]**\n\n"
+            batch_content = batch_header + batch_content
+        try:
+            response = wechat.send({"content": batch_content}})
+            if response:
+                result = json.loads(response)
                 if result.get("errcode") == 0:
                     print(f"企业微信第 {i}/{len(batches)} 批次发送成功 [{report_type}]")
                     # 批次间间隔
@@ -2861,6 +2930,80 @@ class NewsAnalyzer:
         except Exception as e:
             print(f"分析流程执行出错: {e}")
             raise
+
+
+class WKWechat:
+    def __init__(self,corpid,corpsecret):
+        self.nheader = {
+            "Connection": "keep-alive",
+            'Accept': "*/*",
+            "User-Agent": ""
+        }
+        self.config_path = './_token'
+        self.corpid = corpsecret
+        self.corpsecret = corpsecret
+        self.access_token = self.init()
+        assert self.access_token != ''
+
+    def init(self):
+        token_json = self.readToken()
+        if 'access_token' not in token_json or time.time() > token_json['expires_in']:
+            json_str = self.http_get(
+                'https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=' + self.corpid + '&corpsecret=' + self.corpsecret)
+            token_json = json.loads(json_str)
+            token_json['expires_in'] = token_json['expires_in'] + time.time()
+            self.saveToken(json.dumps(token_json))
+        if 'access_token' in token_json:
+            return token_json['access_token']
+        return ''
+
+    def readToken(self):
+        if not os.path.exists(self.config_path):
+            return {}
+        f = open(self.config_path, 'rb')
+        json_str = f.read(1024)
+        f.close()
+        if json_str:
+            return json.loads(json_str.decode('u8'))
+        return {}
+
+    def saveToken(self, json_str):
+        f = open(self.config_path, 'wb')
+        f.write(json_str.encode('u8'))
+        f.close()
+
+    def http_get(self, url, cookie=""):
+        mheader = copy.deepcopy(self.nheader)
+        if cookie:
+            mheader["Cookie"] = cookie
+        response = requests.get(url, headers=mheaders, timeout=30 )
+        if response.status_code == 200:
+            retrun response.text
+        return ''
+
+    def http_post_json(self, url, params, cookie=""):
+        mheader = copy.deepcopy(self.nheader)
+        if cookie:
+            mheader["Cookie"] = cookie
+        mheader["Content-Type"] = "application/json"
+        response = requests.post(
+                url, headers=mheaders, json=params, timeout=30
+            )
+        if response.status_code == 200:
+            retrun response.text
+        return ''
+
+    def send(self, msg):
+        self.http_post_json(
+            "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=" + self.access_token,
+            {
+                "touser": "@all",
+                "msgtype": "markdown",
+                "agentid": 1000002,
+                "markdown": msg,
+                "safe": 0
+            }
+        )
 
 
 def main():
